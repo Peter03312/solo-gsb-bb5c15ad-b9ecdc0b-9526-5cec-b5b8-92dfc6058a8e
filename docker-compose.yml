@@ -1,0 +1,15 @@
+services:
+  weave:
+    build: .
+    container_name: weave-designer
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: 8000
+      DB_PATH: /data/weave.db
+    volumes:
+      - weave-data:/data
+    restart: unless-stopped
+
+volumes:
+  weave-data:
