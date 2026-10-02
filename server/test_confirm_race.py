@@ -252,6 +252,169 @@ st0 = get_state()
 check("state 始终带 onesCount/onesRange",
       "onesCount" in st0 and st0["onesRange"] is None)
 
+# ============================================================
+# 候选比选：最多 3 个同样最优（翻转数同为全局最少）的可行网格
+# ============================================================
+
+# DRAFT_A（2x2 [[0,1],[0,1]]）恰有 2 个最优网格，且与当前原稿无关地可枚举
+pv = client.post("/api/preview", json=DRAFT_A).get_json()
+check("预览带 candidates 与 candidateCount",
+      pv["solvable"] and isinstance(pv.get("candidates"), list)
+      and pv.get("candidateCount") == len(pv["candidates"])
+      and 1 <= len(pv["candidates"]) <= 3,
+      json.dumps({k: pv.get(k) for k in
+                  ("candidateCount", "candidates")}, ensure_ascii=False)[:300])
+check("候选网格互不相同",
+      len({json.dumps(c["repaired"]) for c in pv["candidates"]})
+      == len(pv["candidates"]))
+c0, c1 = pv["candidates"][0], pv["candidates"][1]
+check("每个候选带网格/翻转坐标/1总数",
+      all(set(c.keys()) >= {"repaired", "flips", "onesCount"}
+          for c in pv["candidates"]))
+check("候选翻转数同为全局最少且与 flipCount 一致",
+      all(len(c["flips"]) == pv["flipCount"] for c in pv["candidates"])
+      and pv["flipCount"] == len(c0["flips"]))
+check("候选按行展开字典序升序",
+      [tuple(v for row in c["repaired"] for v in row)
+       for c in pv["candidates"]]
+      == sorted(tuple(v for row in c["repaired"] for v in row)
+                for c in pv["candidates"]))
+check("顶层 repaired/flips/flipCount 始终指向候选 0",
+      pv["repaired"] == c0["repaired"] and pv["flips"] == c0["flips"]
+      and pv["flipCount"] == len(c0["flips"]))
+check("候选 onesCount 与网格一致",
+      all(c["onesCount"] == sum(v for row in c["repaired"] for v in row)
+          for c in pv["candidates"]))
+check("2x2 草稿恰有 2 个最优候选", len(pv["candidates"]) == 2,
+      json.dumps([c["repaired"] for c in pv["candidates"]]))
+
+# 不带 choice（旧请求）仍确认首个方案
+before_v = get_state()["version"]
+r = client.post("/api/confirm", json=payload(DRAFT_A, pv["token"]))
+check("旧请求未指定候选 -> 确认首个方案",
+      r.status_code == 200 and r.get_json()["state"]["grid"] == c0["repaired"]
+      and r.get_json()["state"]["version"] == before_v + 1)
+
+# 重新预览，这次选择候选 1
+pv = client.post("/api/preview", json=DRAFT_A).get_json()
+r = client.post("/api/confirm",
+                json={**payload(DRAFT_A, pv["token"]), "choice": 1})
+check("choice=1 确认第二个方案",
+      r.status_code == 200 and r.get_json()["state"]["grid"] == c1["repaired"]
+      and r.get_json()["state"]["onesCount"] == c1["onesCount"],
+      json.dumps(r.get_json())[:200])
+# 令牌已消费，候选 0 也不能再选
+r = client.post("/api/confirm",
+                json={**payload(DRAFT_A, pv["token"]), "choice": 0})
+check("已消费令牌再选候选 0 -> 409", r.status_code == 409)
+
+# --- 越界 / 伪造 choice：400 且不消费令牌 ---
+pv = client.post("/api/preview", json=DRAFT_A).get_json()
+n = pv["candidateCount"]
+before = get_state()
+for bad_choice in (n, n + 5, -1, 99):
+    r = client.post("/api/confirm",
+                    json={**payload(DRAFT_A, pv["token"]), "choice": bad_choice})
+    check(f"choice={bad_choice} 越界 -> 400", r.status_code == 400,
+          r.get_json().get("error", "")[:40])
+for bad_choice in ("1", 1.0, True, [1], None):
+    body = {**payload(DRAFT_A, pv["token"])}
+    if bad_choice is None:
+        body.pop("choice", None)  # None 视为缺省合法，单独不测
+        continue
+    body["choice"] = bad_choice
+    r = client.post("/api/confirm", json=body)
+    check(f"choice={json.dumps(bad_choice)} 类型非法 -> 400",
+          r.status_code == 400)
+after = get_state()
+check("非法 choice 不消费令牌、原稿版本与内容不变",
+      after["version"] == before["version"]
+      and after["grid"] == before["grid"])
+# 令牌仍可用于合法选择
+r = client.post("/api/confirm",
+                json={**payload(DRAFT_A, pv["token"]), "choice": 0})
+check("非法选择后令牌仍可合法确认候选 0",
+      r.status_code == 200
+      and r.get_json()["state"]["grid"] == c0["repaired"])
+
+# --- 伪造选择 + 改动草稿：先 409 mismatch（令牌仍未消费）---
+pv = client.post("/api/preview", json=DRAFT_A).get_json()
+r = client.post("/api/confirm",
+                json={**payload(DRAFT_B, pv["token"]), "choice": 1})
+check("伪造选择且草稿不一致 -> 409 mismatch", r.status_code == 409)
+r = client.post("/api/confirm", json=payload(DRAFT_A, pv["token"]))
+check("mismatch 后令牌仍有效，确认首个成功", r.status_code == 200)
+
+# --- 旧版本语义：甲选 1 确认后，乙的旧令牌无论选什么都 409 stale ---
+pa = client.post("/api/preview", json=DRAFT_A).get_json()
+pb = client.post("/api/preview", json=DRAFT_B).get_json()
+r = client.post("/api/confirm",
+                json={**payload(DRAFT_A, pa["token"]), "choice": 1})
+check("甲选候选1成功", r.status_code == 200
+      and r.get_json()["state"]["grid"] == pa["candidates"][1]["repaired"])
+for ch in (0, 1):
+    r = client.post("/api/confirm",
+                    json={**payload(DRAFT_B, pb["token"]), "choice": ch})
+    check(f"乙旧令牌 choice={ch} -> 409 stale", r.status_code == 409)
+check("乙失败后原稿仍是甲所选候选1",
+      get_state()["grid"] == pa["candidates"][1]["repaired"])
+
+# --- 同一令牌并发选不同候选：仅一次生效，原稿只被覆盖一次 ---
+pv = client.post("/api/preview", json=DRAFT_A).get_json()
+before = get_state()
+barrier2 = threading.Barrier(4)
+
+
+def fire_choice(ch):
+    barrier2.wait()
+    return client.post("/api/confirm",
+                       json={**payload(DRAFT_A, pv["token"]), "choice": ch})
+
+
+with ThreadPoolExecutor(max_workers=4) as ex:
+    futs = [ex.submit(fire_choice, i % 2) for i in range(4)]
+    codes = [f.result().status_code for f in futs]
+after = get_state()
+ok = [code for code in codes if code == 200]
+check("4 个并发选择仅 1 个成功", len(ok) == 1, f"results={codes}")
+check("并发后版本只递增一次", after["version"] == before["version"] + 1)
+check("并发后原稿为两个候选之一（确属本预览）",
+      after["grid"] in (c0["repaired"], c1["repaired"]))
+
+# --- 区间 + 候选：每个候选的 1 总数都落在区间内 ---
+cur = get_state()
+R4 = {"rows": 4, "cols": 4,
+      "grid": [[0] * 4 for _ in range(4)], "locks": [], "k": 2}
+pr = client.post("/api/preview", json={**R4, "onesRange": [8, 8]}).get_json()
+check("区间预览返回多个候选且全部达标",
+      pr["solvable"] and pr["candidateCount"] >= 2
+      and all(8 <= c["onesCount"] <= 8 for c in pr["candidates"])
+      and all(len(c["flips"]) == pr["flipCount"] for c in pr["candidates"]))
+r = client.post("/api/confirm",
+                json={**R4, "onesRange": [8, 8], "token": pr["token"],
+                      "choice": pr["candidateCount"] - 1})
+last = pr["candidates"][-1]
+check("区间下确认末尾候选成功并持久化区间",
+      r.status_code == 200
+      and r.get_json()["state"]["grid"] == last["repaired"]
+      and r.get_json()["state"]["onesRange"] == [8, 8]
+      and r.get_json()["state"]["onesCount"] == last["onesCount"])
+
+# --- 无令牌/无解相关：无解仍不返回 candidates ---
+uns = client.post("/api/preview",
+                  json=make_draft([[0]], locks=[[0, 0]], k=2)).get_json()
+check("无解响应无 candidates 无 token",
+      uns["solvable"] is False and "token" not in uns
+      and "candidates" not in uns)
+
+# 预览响应仍包含旧字段
+pv = client.post("/api/preview", json=DRAFT_A).get_json()
+check("预览响应字段向后兼容（含候选字段）",
+      {"solvable", "token", "violations", "input", "repaired", "flips",
+       "flipCount", "candidates", "candidateCount"}.issubset(pv.keys()))
+r = client.post("/api/confirm", json=payload(DRAFT_A, pv["token"]))
+check("收尾确认成功", r.status_code == 200)
+
 print()
 if FAILS:
     print(f"{len(FAILS)} 项失败：{FAILS}")

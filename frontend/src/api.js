@@ -23,10 +23,14 @@ export function postPreview(design) {
   });
 }
 
-export function postConfirm(token, design) {
+export function postConfirm(token, design, choice) {
+  // choice 缺省/0：确认预览返回的首个方案（旧请求不带该字段，行为不变）；
+  // >0：确认该预览候选中的指定方案。
+  const body = { token, ...design };
+  if (choice) body.choice = choice;
   return request("/api/confirm", {
     method: "POST",
     headers: jsonHeaders,
-    body: JSON.stringify({ token, ...design }),
+    body: JSON.stringify(body),
   });
 }

@@ -222,6 +222,7 @@ export default function App() {
   const [draft, setDraft] = useState(null);
   const [mode, setMode] = useState("value");
   const [preview, setPreview] = useState(null);
+  const [choice, setChoice] = useState(0);
   const [message, setMessage] = useState(null);
   const [busy, setBusy] = useState(false);
 
@@ -249,9 +250,15 @@ export default function App() {
   const canConfirm = Boolean(
     preview && preview.solvable && !previewStale && !busy && !rangeOutOfBounds);
 
+  // 当前选中的候选（默认且恒为合法范围的首个）；顶层字段始终等同候选 0
+  const candidates = preview?.candidates ?? [];
+  const selectedIndex = Math.min(choice, Math.max(0, candidates.length - 1));
+  const selected = candidates[selectedIndex] ?? null;
+
   const flipSet = useMemo(
-    () => new Set((preview?.flips ?? []).map(([r, c]) => `${r},${c}`)),
-    [preview],
+    () => new Set(((selected?.flips) ?? (preview?.flips ?? []))
+      .map(([r, c]) => `${r},${c}`)),
+    [selected, preview],
   );
   const previewLockSet = useMemo(
     () => (preview ? lockSetOf(preview.input.locks) : new Set()),
@@ -320,11 +327,13 @@ export default function App() {
     try {
       const result = await postPreview(draft);
       setPreview(result);
+      setChoice(0);
       const rangeText = result.onesRange
         ? `，格值1总数须在 [${result.onesRange[0]}, ${result.onesRange[1]}] 内`
         : "";
       setMessage(result.solvable
-        ? { type: "success", text: `预览成功：最少翻转 ${result.flipCount} 格${rangeText}，确认后覆盖原稿。` }
+        ? { type: "success",
+            text: `预览成功：最少翻转 ${result.flipCount} 格，共 ${result.candidateCount} 个同样最优的候选方案，可逐个查看后选择确认${rangeText}。` }
         : { type: "info", text: "无可行修补：在锁定格、浮长与格值1总数区间约束下找不到达标稿件，已保留原稿，请调整后重试。" });
     } catch (e) {
       setPreview(null);
@@ -338,16 +347,23 @@ export default function App() {
     if (!preview?.token) return;
     setBusy(true);
     try {
-      const { state } = await postConfirm(preview.token, draft);
+      const { state } = await postConfirm(preview.token, draft, selectedIndex);
       setOriginal(state);
       setDraft(cloneDesign(state));
       setPreview(null);
-      setMessage({ type: "success", text: "已确认当前预览并覆盖原稿，后续编辑基于新原稿。" });
+      setChoice(0);
+      setMessage({
+        type: "success",
+        text: selectedIndex === 0
+          ? "已确认首个（字典序最小）预览方案并覆盖原稿，后续编辑基于新原稿。"
+          : `已确认候选方案 ${selectedIndex + 1} 并覆盖原稿，后续编辑基于新原稿。`,
+      });
     } catch (e) {
       if (e.status === 409) {
         // 冲突（令牌已消费/原稿已更新/草稿不匹配）：清除旧预览，
         // 重新拉取原稿，保留当前未提交草稿，提示重新预览。
         setPreview(null);
+        setChoice(0);
         try {
           const s = await fetchState();
           setOriginal(s);
@@ -517,31 +533,54 @@ export default function App() {
               )}
               {preview.solvable ? (
                 <>
+                  {candidates.length > 1 && (
+                    <div className="candidate-bar" role="group"
+                         aria-label="候选方案选择">
+                      <span className="candidate-label">
+                        同样最优的候选（翻转数相同，按格值行展开字典序排列）：
+                      </span>
+                      <div className="candidate-tabs">
+                        {candidates.map((cand, i) => (
+                          <button
+                            key={i}
+                            type="button"
+                            className={i === selectedIndex ? "active" : ""}
+                            aria-pressed={i === selectedIndex}
+                            onClick={() => setChoice(i)}
+                          >
+                            方案 {i + 1}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                   <WeaveGrid
-                    grid={preview.repaired}
+                    grid={selected.repaired}
                     lockSet={previewLockSet}
                     markOf={(r, c, key) => (flipSet.has(key) ? "flipped" : "")}
                   />
                   <p className="meta count-line">
-                    格值1总数：{preview.onesCount} → <strong>{preview.repairedOnesCount}</strong>
+                    格值1总数：{preview.onesCount} →{" "}
+                    <strong>{selected.onesCount}</strong>
                     {preview.onesRange
                       ? <> · 要求区间 <strong>[{preview.onesRange[0]}, {preview.onesRange[1]}]</strong>
-                          {preview.repairedOnesCount >= preview.onesRange[0]
-                            && preview.repairedOnesCount <= preview.onesRange[1]
+                          {selected.onesCount >= preview.onesRange[0]
+                            && selected.onesCount <= preview.onesRange[1]
                             ? " ✓ 达标" : " ✗ 未达标"}
                         </>
                       : " · 未设置区间（沿用原修补规则）"}
+                    {candidates.length > 1 && ` · 候选 ${selectedIndex + 1}/${candidates.length}`}
                   </p>
                   <p className="meta">
-                    最少翻转 {preview.flipCount} 格
-                    {preview.flipCount > 0 && "（绿框 ↺ 为翻转位置）"}
+                    最少翻转 {selected.flips.length} 格
+                    {selected.flips.length > 0 && "（绿框 ↺ 为翻转位置）"}
                   </p>
-                  {preview.flipCount > 0 && (
+                  {selected.flips.length > 0 && (
                     <ul className="flip-list">
-                      {preview.flips.map(([r, c]) => (
+                      {selected.flips.map(([r, c]) => (
                         <li key={`${r},${c}`}>
                           第 {r + 1} 行第 {c + 1} 列：
-                          {preview.input.grid[r][c]} → {preview.repaired[r][c]}
+                          {preview.input.grid[r][c]} → {selected.repaired[r][c]}
                         </li>
                       ))}
                     </ul>

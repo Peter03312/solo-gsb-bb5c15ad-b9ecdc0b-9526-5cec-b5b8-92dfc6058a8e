@@ -7,7 +7,7 @@ import uuid
 from flask import Flask, jsonify, request, send_from_directory
 
 from db import Database
-from solver import solve_repair
+from solver import solve_repair_candidates
 from validate import ValidationError, canonical, validate_design
 from weave import find_violations
 
@@ -49,7 +49,7 @@ def preview():
     input_obj = canonical(rows, cols, grid, locks, k, ones_range)
     input_text = _canonical_text(input_obj)
     violations = find_violations(grid, rows, cols, k)
-    solved = solve_repair(rows, cols, k, grid, locks, ones_range)
+    solved = solve_repair_candidates(rows, cols, k, grid, locks, ones_range)
 
     if solved is None:
         # 无可行修补（含格值1总数区间不可达）：保留原稿，仅报无解（不发放令牌）
@@ -61,10 +61,16 @@ def preview():
             "onesRange": input_obj["onesRange"],
         })
 
+    candidates = solved["candidates"]
+    first = candidates[0]
+    # repaired/flips/flipCount 始终指向字典序最小的首个方案，旧客户端无感；
+    # candidates 给出同样最优（翻转数同为全局最少）的前 3 个互不相同网格，
+    # 每项含网格、翻转坐标与格值1总数。
     result = {
-        "repaired": solved["repaired"],
-        "flips": solved["flips"],
-        "flipCount": len(solved["flips"]),
+        "repaired": first["repaired"],
+        "flips": first["flips"],
+        "flipCount": solved["flipCount"],
+        "candidates": candidates,
     }
     token = uuid.uuid4().hex
     # 预览绑定生成时的原稿版本；确认时若该版本已变则拒绝
@@ -76,9 +82,13 @@ def preview():
         "violations": violations,
         "input": input_obj,
         "onesCount": sum(v for row in grid for v in row),
-        "repairedOnesCount": sum(v for row in solved["repaired"] for v in row),
+        "repairedOnesCount": first["onesCount"],
         "onesRange": input_obj["onesRange"],
-        **result,
+        "repaired": result["repaired"],
+        "flips": result["flips"],
+        "flipCount": result["flipCount"],
+        "candidates": candidates,
+        "candidateCount": len(candidates),
     })
 
 
@@ -92,17 +102,29 @@ def confirm():
     if not isinstance(token, str) or not token:
         return jsonify({"error": "缺少预览令牌"}), 400
 
+    # 可选方案选择：省略/为 0 表示确认预览返回的首个（字典序最小）方案；
+    # 旧客户端与旧请求不带该字段，行为不变。bool 不接受（JSON 中属 int）。
+    choice = body.get("choice", 0)
+    if not isinstance(choice, int) or isinstance(choice, bool) or choice < 0:
+        return jsonify({"error": "方案序号 choice 必须是从 0 开始的非负整数"}), 400
+
     try:
         rows, cols, grid, locks, k, ones_range = validate_design(body)
     except ValidationError as exc:
         return jsonify({"error": str(exc)}), 400
 
     # 原子确认：令牌未消费、草稿与预览输入一致（含格值1区间）、预览绑定的
-    # 原稿版本未变，三者同时成立才覆盖原稿（版本仅 +1、区间随原稿持久化）
-    # 并消费令牌；否则整体回滚。
+    # 原稿版本未变、所选方案确在该预览候选内，四者同时成立才覆盖原稿
+    # （版本仅 +1、区间随原稿持久化）并消费令牌；否则整体回滚。
     input_text = _canonical_text(canonical(rows, cols, grid, locks, k, ones_range))
-    design, reason = db.commit_preview(token, input_text)
+    design, reason = db.commit_preview(token, input_text, choice)
     if design is None:
+        if reason == "invalid_choice":
+            # 越界或伪造（候选不在本次预览结果内）：拒绝且令牌保持未消费
+            return jsonify({
+                "error": "所选方案不在该预览令牌的候选范围内，请从预览返回的"
+                         "方案中重新选择",
+            }), 400
         message = {
             "consumed": "预览令牌不存在或已被确认，请重新预览",
             "mismatch": "预览后稿件已变动，旧预览已失效，请重新预览",

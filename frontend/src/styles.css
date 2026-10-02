@@ -174,6 +174,30 @@ main {
   vertical-align: middle;
 }
 
+.candidate-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.6rem;
+  margin-bottom: 0.6rem;
+  padding: 0.45rem 0.55rem;
+  background: #f4f6fc;
+  border: 1px solid #dde1ec;
+  border-radius: 8px;
+}
+.candidate-label { font-size: 0.8rem; color: #5a6072; }
+.candidate-tabs { display: inline-flex; gap: 0.35rem; flex-wrap: wrap; }
+.candidate-tabs button {
+  padding: 0.25rem 0.6rem;
+  font-size: 0.85rem;
+  border-radius: 6px;
+}
+.candidate-tabs button.active {
+  background: var(--weft);
+  border-color: var(--weft);
+  color: #fff;
+}
+
 footer {
   margin-top: 0.6rem;
   font-size: 0.85rem;

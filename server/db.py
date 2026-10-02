@@ -1,8 +1,9 @@
 """SQLite 持久化：当前原稿 + 待确认的预览。
 
 预览在生成时绑定当时的原稿版本；确认在单条事务内原子地完成：
-令牌未消费、草稿与预览输入一致、原稿版本未变三个条件全部满足时，
-才覆盖原稿（版本恰好 +1）并消费令牌，任一条件不满足则整体回滚。
+令牌未消费、草稿与预览输入一致、原稿版本未变、所选方案在本次预览
+候选内四个条件全部满足时，才覆盖原稿（版本恰好 +1）并消费令牌，
+任一条件不满足则整体回滚（非法选择不消费令牌）。
 """
 
 import json
@@ -46,7 +47,7 @@ DEFAULT_DESIGN = {
 }
 
 # 确认失败的原子结果：(设计稿, None) 成功；(None, 原因) 冲突
-CONSUME_REASONS = ("consumed", "mismatch", "stale")
+CONSUME_REASONS = ("consumed", "mismatch", "stale", "invalid_choice")
 
 
 def _now():
@@ -132,14 +133,19 @@ class Database:
                 (token, input_text, json.dumps(result_obj), base_version, _now()),
             )
 
-    def commit_preview(self, token, input_text):
+    def commit_preview(self, token, input_text, choice=0):
         """原子确认预览。
 
         成功返回 (design, None)：在同一事务内校验并执行
             1. 令牌存在且未消费（DELETE 命中 1 行）；
             2. 提交草稿与预览输入一致（input_text 逐字节相同）；
-            3. 预览绑定的原稿版本与当前原稿一致（未被他人确认覆盖）。
-        冲突时全部回滚、原稿不变，返回 (None, "consumed" | "mismatch" | "stale")。
+            3. 预览绑定的原稿版本与当前原稿一致（未被他人确认覆盖）；
+            4. choice 为本次预览返回候选的合法下标（旧预览无候选列表时
+               只允许 0）。
+        冲突时全部回滚、原稿不变，返回
+        (None, "consumed" | "mismatch" | "stale" | "invalid_choice")。
+        注意：非法 choice 与 mismatch/stale 一样整体回滚，令牌不被消费；
+        但同一令牌下只要令牌、草稿、版本未变，可改回合法 choice 重试。
         """
         with self._lock:
             conn = self._connect()
@@ -163,7 +169,19 @@ class Database:
                     return None, "stale"
 
                 result = json.loads(prow["result_json"])
-                grid = result["repaired"]
+                candidates = result.get("candidates")
+                # 旧版预览（结果中无候选列表）只能确认首个方案
+                if candidates is None:
+                    if choice != 0:
+                        conn.execute("ROLLBACK")
+                        return None, "invalid_choice"
+                    grid = result["repaired"]
+                else:
+                    if not isinstance(choice, int) or isinstance(choice, bool) \
+                            or not 0 <= choice < len(candidates):
+                        conn.execute("ROLLBACK")
+                        return None, "invalid_choice"
+                    grid = candidates[choice]["repaired"]
                 input_obj = json.loads(input_text)
                 rows, cols, locks, k = (
                     input_obj["rows"], input_obj["cols"],

@@ -5,7 +5,7 @@ import random
 import sys
 import time
 
-from solver import solve_repair
+from solver import solve_repair, solve_repair_candidates
 from weave import find_violations
 
 
@@ -163,6 +163,104 @@ def main():
         check_case(rows, cols, k, grid, locks,
                    f"随机#{i} {rows}x{cols} K={k} 锁{len(locks)}")
 
+    print("== 候选比选（同样最优的前 3 个互不相同网格）==")
+
+    def brute_optimal_grids(rows, cols, k, grid, locks, lo=None, hi=None):
+        """暴力：返回全部最优网格的有序列表 (翻转数, [行展开 tuple, ...])。
+
+        合法（含区间）且翻转数最少的网格，按行展开字典序升序。
+        """
+        locked = set(map(tuple, locks))
+        free = [(r, c) for r in range(rows) for c in range(cols)
+                if (r, c) not in locked]
+        best_n = None
+        grids = []
+        for bits in itertools.product((0, 1), repeat=len(free)):
+            g = [row[:] for row in grid]
+            for (r, c), b in zip(free, bits):
+                g[r][c] = b
+            if find_violations(g, rows, cols, k):
+                continue
+            ones = sum(v for row in g for v in row)
+            if lo is not None and not (lo <= ones <= hi):
+                continue
+            flips = sum(b != grid[r][c] for (r, c), b in zip(free, bits))
+            if best_n is None or flips < best_n:
+                best_n, grids = flips, [tuple(v for row in g for v in row)]
+            elif flips == best_n:
+                grids.append(tuple(v for row in g for v in row))
+        if best_n is None:
+            return None
+        grids.sort()
+        return best_n, grids
+
+    def check_candidates(rows, cols, k, grid, locks, lo=None, hi=None,
+                         label=""):
+        ones_range = None if lo is None else (lo, hi)
+        expected = brute_optimal_grids(rows, cols, k, grid, locks, lo, hi)
+        got = solve_repair_candidates(
+            rows, cols, k, grid, locks, ones_range)
+        if expected is None:
+            assert got is None, f"{label}: 应无解但解出 {got}"
+            print(f"  [OK] {label}: 无可行修补（与暴力一致）")
+            return
+        assert got is not None, f"{label}: 应有解但报无解"
+        best_n, all_grids = expected
+        exp = all_grids[:3]
+        assert got["flipCount"] == best_n, (
+            f"{label}: 最少翻转 {got['flipCount']} != {best_n}")
+        got_seqs = [tuple(v for row in c["repaired"] for v in row)
+                    for c in got["candidates"]]
+        assert got_seqs == exp, (
+            f"{label}: 候选序列不一致\n  got {got_seqs}\n  exp {exp}")
+        # 每个候选字段自洽、翻转数同为全局最少、网格互不相同
+        assert len(set(got_seqs)) == len(got_seqs)
+        assert 1 <= len(got_seqs) <= 3
+        for c in got["candidates"]:
+            assert len(c["flips"]) == best_n
+            assert c["onesCount"] == sum(c["repaired"][r][cc]
+                                         for r in range(rows)
+                                         for cc in range(cols))
+            assert not find_violations(c["repaired"], rows, cols, k)
+            if lo is not None:
+                assert lo <= c["onesCount"] <= hi
+        # 单解接口恒与候选 0 一致
+        single = solve_repair(rows, cols, k, grid, locks, ones_range)
+        assert tuple(v for row in single["repaired"] for v in row) == exp[0]
+        print(f"  [OK] {label}: 最优共 {len(all_grids)} 个网格，"
+              f"返回 {len(exp)} 个，翻转 {best_n} 格")
+
+    check_candidates(2, 2, 2, [[0, 1], [0, 1]], [], label="2x2 列全同 2 个最优")
+    check_candidates(4, 4, 2, [[0] * 4 for _ in range(4)], [],
+                     label="4x4 全0 K=2 前3")
+    check_candidates(4, 4, 2, [[0] * 4 for _ in range(4)], [], 8, 8,
+                     label="4x4 全0 K=2 区间[8,8]")
+    check_candidates(4, 4, 1,
+                     [[0, 1, 0, 1], [1, 0, 1, 0],
+                      [0, 1, 0, 1], [1, 0, 1, 0]], [],
+                     label="平纹唯一最优（0 翻转）")
+    check_candidates(2, 2, 2, [[0] * 2 for _ in range(2)],
+                     [[0, 0], [1, 1]], label="锁对角仅2格自由")
+    check_candidates(4, 4, 2, [[0] * 4 for _ in range(4)], [], 9, 12,
+                     label="区间无解")
+
+    crng = random.Random(7)
+    for i in range(40):
+        rows = crng.randint(2, 4)
+        cols = crng.randint(2, 4)
+        k = crng.randint(1, 4)
+        grid = [[crng.randint(0, 1) for _ in range(cols)] for _ in range(rows)]
+        locks = [[r, c] for r in range(rows) for c in range(cols)
+                 if crng.random() < 0.25]
+        if crng.random() < 0.6:
+            lo = crng.randint(0, rows * cols)
+            hi = crng.randint(lo, rows * cols)
+        else:
+            lo = hi = None
+        check_candidates(rows, cols, k, grid, locks, lo, hi,
+                         f"候选随机#{i} {rows}x{cols} K={k}"
+                         + ("" if lo is None else f" [{lo},{hi}]"))
+
     print("== 大网格性能 ==")
     for k in (1, 2, 3, 5, 8, 16, 1000):
         rows, cols = 16, 8
@@ -205,6 +303,17 @@ def main():
         else:
             print(f"  [OK] 16x8 K=3 区间[{lo},{hi}]: 无解, {dt:.2f}s")
         assert dt < 10, "区间求解超时"
+
+    # 候选枚举（3 个）在硬实例上仍不超过单次 MaxSAT 耗时太多
+    prng2 = random.Random(99)
+    cgrid = [[prng2.randint(0, 1) for _ in range(8)] for _ in range(16)]
+    t0 = time.time()
+    cgot = solve_repair_candidates(16, 8, 3, cgrid, [], (64, 64))
+    dt = time.time() - t0
+    assert cgot is not None and len(cgot["candidates"]) == 3
+    assert all(len(c["flips"]) == cgot["flipCount"] for c in cgot["candidates"])
+    print(f"  [OK] 16x8 K=3 精确区间取3候选: {dt:.2f}s")
+    assert dt < 15, "候选枚举超时"
 
     print("\n全部通过")
     return 0
