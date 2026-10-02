@@ -46,7 +46,9 @@ DEFAULT_DESIGN = {
 }
 
 # 确认失败的原子结果：(设计稿, None) 成功；(None, 原因) 冲突
-CONSUME_REASONS = ("consumed", "mismatch", "stale")
+# bad_candidate：选择了该令牌预览候选之外的序号（越界/伪造），
+# 属于客户端错误（400），同样回滚、不消费令牌、原稿不变。
+CONSUME_REASONS = ("consumed", "mismatch", "stale", "bad_candidate")
 
 
 def _now():
@@ -132,14 +134,20 @@ class Database:
                 (token, input_text, json.dumps(result_obj), base_version, _now()),
             )
 
-    def commit_preview(self, token, input_text):
+    def commit_preview(self, token, input_text, candidate_index=0):
         """原子确认预览。
+
+        candidate_index 选择该令牌预览中枚举到的并列最优候选
+        （0 = 字典序最小，也是旧请求/旧预览的默认值）；序号必须落在
+        预览实际返回的候选范围内，否则按 bad_candidate 回滚、
+        不消费令牌。
 
         成功返回 (design, None)：在同一事务内校验并执行
             1. 令牌存在且未消费（DELETE 命中 1 行）；
             2. 提交草稿与预览输入一致（input_text 逐字节相同）；
-            3. 预览绑定的原稿版本与当前原稿一致（未被他人确认覆盖）。
-        冲突时全部回滚、原稿不变，返回 (None, "consumed" | "mismatch" | "stale")。
+            3. 预览绑定的原稿版本与当前原稿一致（未被他人确认覆盖）；
+            4. candidate_index 是该预览中实际存在的候选。
+        冲突时全部回滚、原稿不变，返回 (None, 原因)。
         """
         with self._lock:
             conn = self._connect()
@@ -156,14 +164,28 @@ class Database:
                 if prow["input_text"] != input_text:
                     conn.execute("ROLLBACK")
                     return None, "mismatch"
+
+                result = json.loads(prow["result_json"])
+                candidates = result.get("candidates")
+                if candidates is None:
+                    # 旧版预览（result_json 中无 candidates）：仅有首个方案
+                    candidates = [{
+                        "repaired": result["repaired"],
+                        "flips": result.get("flips", []),
+                    }]
+                if not isinstance(candidate_index, int) \
+                        or not 0 <= candidate_index < len(candidates):
+                    conn.execute("ROLLBACK")
+                    return None, "bad_candidate"
+                selected = candidates[candidate_index]
+
                 drow = conn.execute(
                     "SELECT * FROM design WHERE id = 1").fetchone()
                 if prow["base_version"] != drow["version"]:
                     conn.execute("ROLLBACK")
                     return None, "stale"
 
-                result = json.loads(prow["result_json"])
-                grid = result["repaired"]
+                grid = selected["repaired"]
                 input_obj = json.loads(input_text)
                 rows, cols, locks, k = (
                     input_obj["rows"], input_obj["cols"],

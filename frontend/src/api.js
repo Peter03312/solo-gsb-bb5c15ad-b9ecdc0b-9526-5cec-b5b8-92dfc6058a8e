@@ -23,10 +23,10 @@ export function postPreview(design) {
   });
 }
 
-export function postConfirm(token, design) {
+export function postConfirm(token, design, candidate = 0) {
   return request("/api/confirm", {
     method: "POST",
     headers: jsonHeaders,
-    body: JSON.stringify({ token, ...design }),
+    body: JSON.stringify({ token, candidate, ...design }),
   });
 }

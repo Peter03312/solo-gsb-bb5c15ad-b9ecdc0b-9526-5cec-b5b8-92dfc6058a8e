@@ -2,7 +2,8 @@
 
 把"每行/每列环向相同值连续段长度 <= K，且全同行/列视为无限浮长"
 编码为 SAT 硬约束，用 MaxSAT(RC2) 求翻转未锁定格数最少的修补，
-再以"按行展开字典序最小"为目标逐格假设求解，得到最终格值序列。
+再以"按行展开字典序"为序逐格假设求解，枚举前 limit 个互不相同的
+最优网格（翻转数同为全局最少，按行展开字典序升序）。
 
 格值约定：0 = 经线在上，1 = 纬线在上。
 """
@@ -136,15 +137,72 @@ def _ones_range_clauses(rows, cols, ones_range, next_var):
     return clauses, free
 
 
-def solve_repair(rows, cols, k, grid, locks, ones_range=None):
-    """求最优修补。
+def _enumerate_lex(clauses, rows, cols, locked, limit):
+    """在同一增量 SAT 实例上按行展开字典序枚举至多 limit 个网格模型。
+
+    对未锁定格做深度优先的字典序遍历：每个格优先尝试取 0（负文字），
+    不可行再取 1（正文字）；当前前缀通过 assumptions 携带（回溯即撤销）。
+    每枚举出一个完整模型，就永久加入它的否定作为阻塞子句，
+    保证后续网格与已返回的所有网格互不相同。
+    """
+    free_cells = [(r, c) for r in range(rows) for c in range(cols)
+                  if (r, c) not in locked]
+    results = []
+
+    with Solver(name="g3", bootstrap_with=clauses) as solver:
+        # prefix_lits[j]：第 j 个未锁定格在当前路径上的取值文字（-v=0，v=1）
+        prefix_lits = []
+
+        def extend():
+            """从当前前缀末尾逐格扩展。
+
+            探测某格取 0/1 可行后，只在到达完整前缀时用“同一前缀”做一次
+            确认求解：增量求解器对不同长度 assumptions 的快速应答在极少数
+            实例上并不自洽，以最终完整前缀的确认结果为准；完整前缀不可行
+            （含中途两分支皆不可行）时返回 False，交由上层回溯。
+            """
+            while len(prefix_lits) < len(free_cells):
+                r, c = free_cells[len(prefix_lits)]
+                v = _var(r, c, cols)
+                if solver.solve(assumptions=prefix_lits + [-v]):
+                    prefix_lits.append(-v)
+                elif solver.solve(assumptions=prefix_lits + [v]):
+                    prefix_lits.append(v)
+                else:
+                    return False
+            return solver.solve(assumptions=list(prefix_lits))
+
+        while True:
+            if extend():
+                results.append(set(solver.get_model()))
+                # 永久阻塞该完整模型，之后的遍历只能给出不同网格
+                solver.add_clause([-lit for lit in prefix_lits])
+                if len(results) >= limit:
+                    break
+            # 回溯：逐层弹出两子树均已枚举完的 1 分支，
+            # 找到最近的 0 分支点并改走 1 分支
+            while prefix_lits and prefix_lits[-1] > 0:
+                prefix_lits.pop()
+            if not prefix_lits:
+                break  # 字典序遍历完成
+            prefix_lits[-1] = -prefix_lits[-1]
+    return results
+
+
+def solve_repair_top(rows, cols, k, grid, locks, ones_range=None, limit=3):
+    """求全局最少翻转的前 limit 个并列最优修补（按行展开字典序升序）。
 
     ones_range 给出修补稿格值 1 总数区间 (下限, 上限)，None 表示不限制。
-    返回 None 表示无可行修补；否则返回 dict：
+    返回 None 表示无可行修补；否则返回
     {
-        "repaired": 修补后的二维格值,
-        "flips":    [[r, c], ...] 被翻转的格（按行展开序）,
+        "flip_count": 全局最少翻转数,
+        "candidates": [
+            {"repaired": 二维格值, "flips": [[r, c], ...],
+             "onesCount": 格值 1 总数},
+            ...   # 长度 1..limit，网格互不相同
+        ],
     }
+    candidates[0] 即旧版 solve_repair 的结果（字典序最小）。
     """
     hard = build_hard_clauses(rows, cols, k, grid, locks)
     # 格值 1 总数区间与浮长、锁定同为硬约束；辅助变量从格变量之后开始编号
@@ -170,27 +228,42 @@ def solve_repair(rows, cols, k, grid, locks, ones_range=None):
             return None
         best = rc2.cost
 
-    # 第二阶段：在翻转数 <= best 的约束下，逐格求字典序最小格值序列
+    # 第二阶段：在翻转数 <= best 的约束下，按行展开字典序枚举前 limit 个网格。
+    # 最优翻转数唯一（best），所有候选翻转数相同（同为最优）。
     clauses = [cl[:] for cl in hard]
     clauses, _ = _at_most(clauses, _flip_lits(rows, cols, grid, locks),
                           best, next_free)
 
-    with Solver(name="g3", bootstrap_with=clauses) as solver:
-        for r in range(rows):
-            for c in range(cols):
-                if (r, c) in locked:
-                    continue
-                v = _var(r, c, cols)
-                # 字典序最小：优先尝试该格取 0
-                if solver.solve(assumptions=[-v]):
-                    solver.add_clause([-v])
-                else:
-                    solver.add_clause([v])
-        assert solver.solve(), "翻转数约束下应恒有解"
-        model = set(solver.get_model())
+    models = _enumerate_lex(clauses, rows, cols, locked, limit)
+    assert models, "翻转数最优约束下应恒有解"
 
-    repaired = [[1 if _var(r, c, cols) in model else 0
-                 for c in range(cols)] for r in range(rows)]
-    flips = [[r, c] for r in range(rows) for c in range(cols)
-             if repaired[r][c] != grid[r][c]]
-    return {"repaired": repaired, "flips": flips}
+    candidates = []
+    for model in models:
+        repaired = [[1 if _var(r, c, cols) in model else 0
+                     for c in range(cols)] for r in range(rows)]
+        flips = [[r, c] for r in range(rows) for c in range(cols)
+                 if repaired[r][c] != grid[r][c]]
+        assert len(flips) == best, "候选必须同为全局最少翻转数"
+        candidates.append({
+            "repaired": repaired,
+            "flips": flips,
+            "onesCount": sum(v for row in repaired for v in row),
+        })
+    return {"flip_count": best, "candidates": candidates}
+
+
+def solve_repair(rows, cols, k, grid, locks, ones_range=None):
+    """求字典序最小的最优修补（solve_repair_top 的单候选便捷封装）。
+
+    ones_range 给出修补稿格值 1 总数区间 (下限, 上限)，None 表示不限制。
+    返回 None 表示无可行修补；否则返回 dict：
+    {
+        "repaired": 修补后的二维格值,
+        "flips":    [[r, c], ...] 被翻转的格（按行展开序）,
+    }
+    """
+    solved = solve_repair_top(rows, cols, k, grid, locks, ones_range, limit=1)
+    if solved is None:
+        return None
+    first = solved["candidates"][0]
+    return {"repaired": first["repaired"], "flips": first["flips"]}

@@ -5,7 +5,7 @@ import random
 import sys
 import time
 
-from solver import solve_repair
+from solver import solve_repair, solve_repair_top
 from weave import find_violations
 
 
@@ -26,6 +26,34 @@ def brute_force(rows, cols, k, grid, locks):
         if best is None or (flips, flat) < (best[0], best[1]):
             best = (flips, flat)
     return best
+
+
+def brute_force_top(rows, cols, k, grid, locks, ones_range=None, limit=3):
+    """暴力枚举：返回全局最少翻转、按行展开字典序前 limit 个互不相同的网格。
+
+    每项为 (翻转数, 展开序列)；无解返回 None。
+    """
+    locked = set(map(tuple, locks))
+    free = [(r, c) for r in range(rows) for c in range(cols)
+            if (r, c) not in locked]
+    sols = []
+    for bits in itertools.product((0, 1), repeat=len(free)):
+        g = [row[:] for row in grid]
+        for (r, c), b in zip(free, bits):
+            g[r][c] = b
+        if find_violations(g, rows, cols, k):
+            continue
+        ones = sum(v for row in g for v in row)
+        if ones_range is not None and not (ones_range[0] <= ones <= ones_range[1]):
+            continue
+        flips = sum(b != grid[r][c] for (r, c), b in zip(free, bits))
+        sols.append((flips, tuple(v for row in g for v in row)))
+    if not sols:
+        return None
+    best = min(f for f, _ in sols)
+    top = sorted(((f, seq) for f, seq in sols if f == best),
+                 key=lambda x: x[1])[:limit]
+    return top
 
 
 def flat(grid):
@@ -124,6 +152,93 @@ def main():
     check_range(2, 2, 2, [[0] * 2 for _ in range(2)],
                 [[0, 0], [1, 1]], 3, 4, "锁两0又要求>=3个1 无解")
 
+    print("== 前 3 个同样最优候选（暴力对照） ==")
+
+    def check_top(rows, cols, k, grid, locks, ones_range, label, limit=3):
+        expected = brute_force_top(rows, cols, k, grid, locks,
+                                   ones_range, limit)
+        got = solve_repair_top(rows, cols, k, grid, locks, ones_range, limit)
+        if expected is None:
+            assert got is None, f"{label}: 应无解但解出 {got}"
+            print(f"  [OK] {label}: 无可行修补（与暴力一致）")
+            return
+        assert got is not None, f"{label}: 应有解但报无解"
+        assert got["flip_count"] == expected[0][0], (
+            f"{label}: 最优翻转数 {got['flip_count']} != {expected[0][0]}")
+        assert len(got["candidates"]) == len(expected), (
+            f"{label}: 候选数 {len(got['candidates'])} != {len(expected)}")
+        seen = set()
+        for cand, (ef, eseq) in zip(got["candidates"], expected):
+            seq = tuple(v for row in cand["repaired"] for v in row)
+            assert seq == eseq, f"{label}: 字典序错误 {seq} != {eseq}"
+            assert len(cand["flips"]) == ef == got["flip_count"], (
+                f"{label}: 候选翻转数不一致")
+            assert cand["onesCount"] == sum(seq)
+            assert not find_violations(cand["repaired"], rows, cols, k)
+            seen.add(seq)
+        assert len(seen) == len(expected), f"{label}: 候选网格必须互不相同"
+        if ones_range is not None:
+            for cand in got["candidates"]:
+                n = cand["onesCount"]
+                assert ones_range[0] <= n <= ones_range[1]
+        for (r, c) in locks:
+            for cand in got["candidates"]:
+                assert cand["repaired"][r][c] == grid[r][c]
+        print(f"  [OK] {label}: {len(expected)} 个并列最优，各翻转 "
+              f"{expected[0][0]} 格")
+
+    # 固定并列用例：2x2 全0 K=2 恰有 2 个并列（两个对角方向）
+    check_top(2, 2, 2, [[0, 0], [0, 0]], [], None, "2x2 全0 K=2 两候选")
+    # 3x3 全0 K=2：每行/列恰一个1，共 6 个并列，取前 3
+    check_top(3, 3, 2, [[0] * 3 for _ in range(3)], [], None,
+              "3x3 全0 K=2 前三候选")
+    # 解唯一（0 翻转）时只有 1 个候选
+    plain = [[0, 1, 0, 1], [1, 0, 1, 0], [0, 1, 0, 1], [1, 0, 1, 0]]
+    check_top(4, 4, 1, plain, [], None, "平纹已合法 仅1候选")
+    # 无解
+    check_top(1, 1, 1, [[0]], [[0, 0]], None, "1x1 锁定 无解")
+    # limit=1 等价 solve_repair
+    check_top(4, 4, 2, [[0] * 4 for _ in range(4)], [], None,
+              "4x4 全0 K=2 limit=1", limit=1)
+    # 区间下的并列枚举
+    check_top(3, 3, 2, [[0] * 3 for _ in range(3)], [], (3, 3),
+              "3x3 全0 K=2 区间[3,3]")
+    check_top(4, 4, 2, [[0] * 4 for _ in range(4)], [], (8, 8),
+              "4x4 全0 K=2 区间[8,8]")
+
+    trng = random.Random(2027)
+    for i in range(60):
+        rows = trng.randint(2, 4)
+        cols = trng.randint(2, 4)
+        k = trng.randint(1, 4)
+        grid = [[trng.randint(0, 1) for _ in range(cols)] for _ in range(rows)]
+        locks = [[r, c] for r in range(rows) for c in range(cols)
+                 if trng.random() < 0.2]
+        if trng.random() < 0.5:
+            lo = trng.randint(0, rows * cols)
+            orng = (lo, trng.randint(lo, rows * cols))
+        else:
+            orng = None
+        check_top(rows, cols, k, grid, locks, orng,
+                  f"候选随机#{i} {rows}x{cols} K={k}")
+
+    # 封装一致性：limit=1 的首候选与 solve_repair 完全一致
+    for i in range(10):
+        rows = trng.randint(2, 4)
+        cols = trng.randint(2, 4)
+        k = trng.randint(1, 4)
+        grid = [[trng.randint(0, 1) for _ in range(cols)] for _ in range(rows)]
+        locks = [[r, c] for r in range(rows) for c in range(cols)
+                 if trng.random() < 0.2]
+        a = solve_repair(rows, cols, k, grid, locks)
+        b = solve_repair_top(rows, cols, k, grid, locks, None, 1)
+        if a is None:
+            assert b is None
+        else:
+            assert a["repaired"] == b["candidates"][0]["repaired"]
+            assert a["flips"] == b["candidates"][0]["flips"]
+    print("  [OK] solve_repair 与 solve_repair_top(limit=1) 首候选一致")
+
     print("== 区间随机小网格对照暴力 ==")
     rrng = random.Random(2026)
     for i in range(30):
@@ -205,6 +320,22 @@ def main():
         else:
             print(f"  [OK] 16x8 K=3 区间[{lo},{hi}]: 无解, {dt:.2f}s")
         assert dt < 10, "区间求解超时"
+
+    print("== 大网格性能（前 3 候选） ==")
+    qrng = random.Random(3027)
+    for k in (1, 2, 3, 5, 8):
+        qgrid = [[qrng.randint(0, 1) for _ in range(8)] for _ in range(16)]
+        t0 = time.time()
+        qgot = solve_repair_top(16, 8, k, qgrid, [], None, limit=3)
+        dt = time.time() - t0
+        assert qgot is not None
+        assert 1 <= len(qgot["candidates"]) <= 3
+        for cand in qgot["candidates"]:
+            assert not find_violations(cand["repaired"], 16, 8, k)
+            assert len(cand["flips"]) == qgot["flip_count"]
+        print(f"  [OK] 16x8 K={k}: {len(qgot['candidates'])} 候选, "
+              f"各翻转 {qgot['flip_count']} 格, {dt:.2f}s")
+        assert dt < 15, "前3候选枚举超时"
 
     print("\n全部通过")
     return 0

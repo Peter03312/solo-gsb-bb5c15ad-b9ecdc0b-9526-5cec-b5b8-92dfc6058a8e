@@ -174,6 +174,24 @@ main {
   vertical-align: middle;
 }
 
+.candidate-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.6rem;
+}
+.candidate-bar button {
+  padding: 0.3rem 0.7rem;
+  font-size: 0.88rem;
+}
+.candidate-bar button.active {
+  background: var(--ok);
+  border-color: var(--ok);
+  color: #fff;
+}
+.candidate-bar .meta { flex: 1 1 100%; font-size: 0.8rem; }
+
 footer {
   margin-top: 0.6rem;
   font-size: 0.85rem;
